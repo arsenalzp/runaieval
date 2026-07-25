@@ -1,0 +1,266 @@
+name: AI Agents and RAG-system CI/CD gate
+
+on:
+  workflow_call:
+    inputs:
+      template_path_rag:
+        description: "Path to RAG EvalRun template"
+        required: false
+        type: string
+        default: ".github/templates/evalrun-rag.yaml.tpl"
+      template_path_agent:
+        description: "Path to AI Agent EvalRun template"
+        required: false
+        type: string
+        default: ".github/templates/evalrun-agent.yaml.tpl"
+      endpoint_rag:
+        description: "Target endpoint for RAG testing"
+        required: false
+        type: string
+        default: "http://k8s:8080/rag/query?debug=true"
+      endpoint_agent:
+        description: "Target endpoint for AI Agent testing"
+        required: false
+        type: string
+        default: "http://k8s:8080/agent/invoke"
+      default_namespace:
+        description: "Kubernetes namespace"
+        required: false
+        type: string
+        default: "default"
+      default_evalsuite:
+        description: "Default evaluation suite name"
+        required: false
+        type: string
+        default: "demo-suite"
+
+env:
+  EVALRUN_RESOURCE: EvalRun
+
+jobs:
+  ai-rag-test:
+    timeout-minutes: 30
+    runs-on: self-hosted
+    steps:
+     - name: Checkout repository
+       uses: actions/checkout@v4
+
+     - name: Define evaluation suite
+       id: evalsuite
+       run: |
+          EVALSUITE="${{ inputs.default_evalsuite }}"
+
+          if [ "${{ contains(github.event.pull_request.labels.*.name, 'evalsuite:pass') }}" = "true" ]; then
+            EVALSUITE="demo-suite-2q-pass"
+          elif [ "${{ contains(github.event.pull_request.labels.*.name, 'evalsuite:fail') }}" = "true" ]; then
+            EVALSUITE="demo-suite-2q-fail"
+          fi
+          
+          echo "name=$EVALSUITE" >> $GITHUB_OUTPUT
+
+     - name: Resolve EvalRun context
+       id: ctx
+       shell: bash
+       run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            EVALRUN_NAME="pr-${{ github.event.pull_request.number }}-ai-eval"
+            EVALSUITE_NAME="${{ steps.evalsuite.outputs.name }}"
+            NAMESPACE="${{ inputs.default_namespace }}"
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            FAIL_ON_EVAL_FAIL="true"
+
+            if [ "${{ contains(github.event.pull_request.labels.*.name, 'type:agent') }}" = "true" ]; then
+              TEMPLATE_PATH="${{ inputs.template_path_agent }}"
+              TARGET_ENDPOINT="${{ inputs.endpoint_agent }}"
+            else
+              TEMPLATE_PATH="${{ inputs.template_path_rag }}"
+              TARGET_ENDPOINT="${{ inputs.endpoint_rag }}"
+            fi
+          else
+            EVALRUN_NAME="manual-ai-eval-${{ github.run_number }}"
+            EVALSUITE_NAME="${{ steps.evalsuite.outputs.name }}"
+            NAMESPACE="${{ inputs.default_namespace }}"
+            TEMPLATE_PATH="${{ inputs.template_path_rag }}"
+            TARGET_ENDPOINT="${{ inputs.endpoint_rag }}"
+            PR_NUMBER="0"
+            FAIL_ON_EVAL_FAIL="false"
+          fi
+
+          EVALRUN_NAME="$(echo "${EVALRUN_NAME}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | tr -c 'a-z0-9-' '-' \
+            | sed 's/--*/-/g' \
+            | sed 's/^-//;s/-$//')"
+
+          echo "evalrun_name=${EVALRUN_NAME}" >> "$GITHUB_OUTPUT"
+          echo "evalsuite_name=${EVALSUITE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "namespace=${NAMESPACE}" >> "$GITHUB_OUTPUT"
+          echo "template_path=${TEMPLATE_PATH}" >> "$GITHUB_OUTPUT"
+          echo "target_endpoint=${TARGET_ENDPOINT}" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "fail_on_eval_fail=${FAIL_ON_EVAL_FAIL}" >> "$GITHUB_OUTPUT"
+
+          echo "EvalRun: ${EVALRUN_NAME}"
+          echo "EvalSuite: ${EVALSUITE_NAME}"
+          echo "Namespace: ${NAMESPACE}"
+          echo "Template: ${TEMPLATE_PATH}"
+          echo "Target Endpoint: ${TARGET_ENDPOINT}"
+          echo "Commit: ${{ github.sha }}"
+
+     - name: Kubernetes RBAC checks
+       run: kubectl auth can-i create evalrun
+
+     - name: Render EvalRun from template
+       shell: bash
+       env:
+          EVALRUN_NAME: ${{ steps.ctx.outputs.evalrun_name }}
+          EVALSUITE_NAME: ${{ steps.ctx.outputs.evalsuite_name }}
+          NAMESPACE: ${{ steps.ctx.outputs.namespace }}
+          TEMPLATE_PATH: ${{ steps.ctx.outputs.template_path }}
+          TARGET_ENDPOINT: ${{ steps.ctx.outputs.target_endpoint }}
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+          GIT_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_WORKFLOW: ${{ github.workflow }}
+       run: |
+          set -euo pipefail
+
+          if [ ! -f "${TEMPLATE_PATH}" ]; then
+            echo "Template not found: ${TEMPLATE_PATH}"
+            exit 1
+          fi
+
+          if ! command -v envsubst >/dev/null 2>&1; then
+            echo "envsubst is required in the ARC runner image."
+            echo "Add gettext package to the custom runner image."
+            exit 1
+          fi
+
+          envsubst < "${TEMPLATE_PATH}" > evalrun.yaml
+
+          echo "Rendered EvalRun manifest:"
+          cat evalrun.yaml
+
+     - name: Create EvalRun
+       shell: bash
+       run: |
+          set -euo pipefail
+
+          kubectl apply -f evalrun.yaml
+
+     - name: Wait for EvalRun completion
+       shell: bash
+       env:
+          EVALRUN_NAME: ${{ steps.ctx.outputs.evalrun_name }}
+          NAMESPACE: ${{ steps.ctx.outputs.namespace }}
+          EVALRUN_RESOURCE: ${{ env.EVALRUN_RESOURCE }}
+       run: |
+          set -euo pipefail
+
+          echo "Waiting for EvalRun/${EVALRUN_NAME} in namespace ${NAMESPACE}"
+
+          DEADLINE_SECONDS=1500
+          INTERVAL_SECONDS=10
+          ELAPSED=0
+
+          while [ "${ELAPSED}" -lt "${DEADLINE_SECONDS}" ]; do
+            PHASE="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+            VERDICT="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.verdict}' 2>/dev/null || true)"
+            STAGE="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.rootCause.stage}' 2>/dev/null || true)"
+
+            echo "elapsed=${ELAPSED}s phase=${PHASE:-<empty>} verdict=${VERDICT:-<empty>} stage=${STAGE:-<empty>}"
+
+            if [ "${PHASE}" = "COMPLETED" ] || [ "${PHASE}" = "FAILED" ]; then
+              exit 0
+            fi
+
+            sleep "${INTERVAL_SECONDS}"
+            ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
+          done
+
+          echo "Timed out waiting for EvalRun/${EVALRUN_NAME}"
+          exit 1
+     
+     - name: Read EvalRun result
+       id: result
+       shell: bash
+       env:
+          EVALRUN_NAME: ${{ steps.ctx.outputs.evalrun_name }}
+          NAMESPACE: ${{ steps.ctx.outputs.namespace }}
+          EVALRUN_RESOURCE: ${{ env.EVALRUN_RESOURCE }}
+       run: |
+          set -euo pipefail
+
+          PHASE="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+          VERDICT="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.verdict}' 2>/dev/null || true)"
+          ROOT_CAUSE="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.rootCause.stage}' 2>/dev/null || true)"
+          SUMMARY="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.summary}' 2>/dev/null || true)"
+
+          REPORT_URL="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.artifacts.reportUrl}' 2>/dev/null || true)"
+          SUMMARY_URL="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.artifacts.summaryUrl}' 2>/dev/null || true)"
+          RAW_RESULTS_URL="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.artifacts.rawResultsUrl}' 2>/dev/null || true)"
+
+          echo "phase=${PHASE}" >> "$GITHUB_OUTPUT"
+          echo "verdict=${VERDICT}" >> "$GITHUB_OUTPUT"
+          echo "root_cause=${ROOT_CAUSE}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## EvalRun AI / RAG Gate"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| EvalRun | \`${EVALRUN_NAME}\` |"
+            echo "| Namespace | \`${NAMESPACE}\` |"
+            echo "| Phase | \`${PHASE:-unknown}\` |"
+            echo "| Verdict | \`${VERDICT:-unknown}\` |"
+            echo "| Root cause | \`${ROOT_CAUSE:-n/a}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo ""
+            echo "### Summary"
+            echo ""
+            echo "${SUMMARY:-No summary reported.}"
+            echo ""
+            echo "### Artifacts"
+            echo ""
+            echo "- Report: ${REPORT_URL:-not available}"
+            echo "- Gate summary: ${SUMMARY_URL:-not available}"
+            echo "- Raw results: ${RAW_RESULTS_URL:-not available}"
+            echo ""
+            echo "### Workflow responsibility"
+            echo ""
+            echo "- ARC scheduled this GitHub Actions job onto a Kubernetes-hosted self-hosted runner."
+            echo "- GitHub Actions rendered EvalRun from a template."
+            echo "- GitHub Actions created EvalRun."
+            echo "- EvalRun operator reconciled the resource."
+            echo "- Runner pod executed evaluation and uploaded artifacts to object storage."
+            echo "- EvalRun.status exposed the release decision."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+     - name: Fail workflow on non-PASS verdict
+       shell: bash
+       env:
+          PHASE: ${{ steps.result.outputs.phase }}
+          VERDICT: ${{ steps.result.outputs.verdict }}
+          ROOT_CAUSE: ${{ steps.result.outputs.root_cause }}
+          FAIL_ON_EVAL_FAIL: ${{ steps.ctx.outputs.fail_on_eval_fail }}
+       run: |
+          set -euo pipefail
+
+          if [ "${FAIL_ON_EVAL_FAIL}" != "true" ]; then
+            echo "fail_on_eval_fail=false, workflow will not fail on EvalRun verdict."
+            exit 0
+          fi
+
+          if [ "${PHASE}" != "COMPLETED" ]; then
+            echo "EvalRun did not complete successfully. phase=${PHASE}"
+            exit 1
+          fi
+
+          if [ "${VERDICT}" != "PASS" ]; then
+            echo "EvalRun verdict is ${VERDICT}. rootCause=${ROOT_CAUSE}"
+            exit 1
+          fi
+
+          echo "EvalRun verdict is PASS."
