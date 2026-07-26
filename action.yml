@@ -30,19 +30,40 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Define evaluation suite
+    - name: Set evaluation suite
       id: evalsuite
       shell: bash
       run: |
         EVALSUITE="${{ inputs.default_evalsuite }}"
+        
+        LABELS_JSON='${{ toJson(github.event.pull_request.labels.*.name) }}'
+        # Cut out the prefix "evalsuite:" (e.g., "evalsuite:demo-suite-2q-pass" -> "demo-suite-2q-pass")
+        FOUND_LABEL=$(echo "$LABELS_JSON" | jq -r '.[] | select(startswith("evalsuite:")) | sub("^evalsuite:"; "")' | head -n 1)
 
-        if [ "${{ contains(github.event.pull_request.labels.*.name, 'evalsuite:pass') }}" = "true" ]; then
-          EVALSUITE="demo-suite-2q-pass"
-        elif [ "${{ contains(github.event.pull_request.labels.*.name, 'evalsuite:fail') }}" = "true" ]; then
-          EVALSUITE="demo-suite-2q-fail"
+        if [ -n "$FOUND_LABEL" ]; then
+          EVALSUITE="${FOUND_LABEL}"
         fi
         
         echo "name=$EVALSUITE" >> $GITHUB_OUTPUT
+    
+    - name: Set evaluation type
+      id: evaltype
+      shell: bash
+      run: |
+        # Default type is RAG
+        EVAL_TYPE="rag"
+
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          LABELS_JSON='${{ toJson(github.event.pull_request.labels.*.name) }}'
+          IS_AGENT=$(echo "$LABELS_JSON" | jq -r '.[] | select(. == "type:agent" or . == "agent")' | head -n 1)
+
+          if [ -n "$IS_AGENT" ]; then
+            EVAL_TYPE="agent"
+          fi
+        fi
+
+        echo "Selected eval type: $EVAL_TYPE"
+        echo "type=$EVAL_TYPE" >> "$GITHUB_OUTPUT"
 
     - name: Resolve EvalRun context
       id: ctx
@@ -55,9 +76,10 @@ runs:
           EVALSUITE_NAME="${{ steps.evalsuite.outputs.name }}"
           NAMESPACE="${{ inputs.default_namespace }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
+          EVAL_TYPE="${{ steps.evaltype.outputs.type }}"
           FAIL_ON_EVAL_FAIL="true"
 
-          if [ "${{ contains(github.event.pull_request.labels.*.name, 'type:agent') }}" = "true" ]; then
+          if [ "$EVAL_TYPE" = "agent" ]; then
             TEMPLATE_PATH="${{ inputs.template_path_agent }}"
             TARGET_ENDPOINT="${{ inputs.endpoint_agent }}"
           else
@@ -71,7 +93,7 @@ runs:
           TEMPLATE_PATH="${{ inputs.template_path_rag }}"
           TARGET_ENDPOINT="${{ inputs.endpoint_rag }}"
           PR_NUMBER="0"
-          FAIL_ON_EVAL_FAIL="false"
+          FAIL_ON_EVAL_FAIL="true"
         fi
 
         EVALRUN_NAME="$(echo "${EVALRUN_NAME}" \
