@@ -307,11 +307,11 @@ runs:
 
         PAYLOAD=$(jq -n --arg body "$COMMENT_BODY" '{body: $body}')
 
-        # Find existing comment ID using curl + jq
-        EXISTING_COMMENT_ID=$(curl -s -S -H "Authorization: token ${GITHUB_TOKEN}" \
+        RESPONSE=$(curl -s -S -H "Authorization: token ${GITHUB_TOKEN}" \
           -H "Accept: application/vnd.github.v3+json" \
-          "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" \
-          | jq -r ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -n 1)
+          "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments")
+
+        EXISTING_COMMENT_ID=$(echo "$RESPONSE" | jq -r 'if type=="array" then (.[] | select(.body | contains("'"$MARKER"'")) | .id) else empty end' | head -n 1)
 
         if [ -n "${EXISTING_COMMENT_ID}" ] && [ "${EXISTING_COMMENT_ID}" != "null" ]; then
           echo "Updating existing PR comment (ID: ${EXISTING_COMMENT_ID})..."
