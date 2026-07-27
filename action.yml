@@ -280,6 +280,14 @@ runs:
 
         MARKER="<!-- id: ai-eval-gate-comment -->"
 
+        ROOT_CAUSE_SECTION=""
+        if [ -n "${ROOT_CAUSE:-}" ] && [ "${ROOT_CAUSE}" != "null" ] && [ "${ROOT_CAUSE}" != "None" ]; then
+          ROOT_CAUSE_SECTION="### ⚠️ Root Cause Failure Analysis
+        \`\`\`
+        ${ROOT_CAUSE}
+        \`\`\`"
+        fi
+
         COMMENT_BODY=$(cat <<EOF
         ${MARKER}
         ## 🤖 AI / RAG Evaluation Gate Results
@@ -293,10 +301,7 @@ runs:
         | **EvalRun CR** | \`${EVALRUN_NAME}\` |
         | **Commit** | \`${GIT_SHA:0:7}\` |
 
-        $( [ -n "${ROOT_CAUSE}" ] && [ "${ROOT_CAUSE}" != "null" ] && echo "### ⚠️ Root Cause Failure Analysis
-        \`\`\`
-        ${ROOT_CAUSE}
-        \`\`\`" )
+        ${ROOT_CAUSE_SECTION}
 
         ### 📊 Evaluation Artifacts
         - **Full HTML Report:** ${REPORT_URL:-N/A}
@@ -307,26 +312,38 @@ runs:
 
         PAYLOAD=$(jq -n --arg body "$COMMENT_BODY" '{body: $body}')
 
-        RESPONSE=$(curl -s -S -H "Authorization: token ${GITHUB_TOKEN}" \
+        echo "Checking for existing PR comment..."
+        RESPONSE=$(curl -s -S \
+          -H "Authorization: Bearer ${GITHUB_TOKEN}" \
           -H "Accept: application/vnd.github.v3+json" \
           "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments")
 
-        EXISTING_COMMENT_ID=$(echo "$RESPONSE" | jq -r 'if type=="array" then (.[] | select(.body | contains("'"$MARKER"'")) | .id) else empty end' | head -n 1)
+        EXISTING_COMMENT_ID=$(echo "$RESPONSE" | jq -r --arg marker "$MARKER" 'if type=="array" then (.[] | select(.body | contains($marker)) | .id) else empty end' | head -n 1)
 
-        if [ -n "${EXISTING_COMMENT_ID}" ] && [ "${EXISTING_COMMENT_ID}" != "null" ]; then
+        if [ -n "${EXISTING_COMMENT_ID:-}" ] && [ "${EXISTING_COMMENT_ID}" != "null" ]; then
           echo "Updating existing PR comment (ID: ${EXISTING_COMMENT_ID})..."
-          curl -s -S -X PATCH \
-            -H "Authorization: token ${GITHUB_TOKEN}" \
+          HTTP_STATUS=$(curl -s -o /tmp/api_response.json -w "%{http_code}" -X PATCH \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github.v3+json" \
             -d "${PAYLOAD}" \
-            "https://api.github.com/repos/${REPO}/issues/comments/${EXISTING_COMMENT_ID}" > /dev/null
+            "https://api.github.com/repos/${REPO}/issues/comments/${EXISTING_COMMENT_ID}")
         else
           echo "Creating new PR comment..."
-          curl -s -S -X POST \
-            -H "Authorization: token ${GITHUB_TOKEN}" \
+          HTTP_STATUS=$(curl -s -o /tmp/api_response.json -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github.v3+json" \
             -d "${PAYLOAD}" \
-            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" > /dev/null
+            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments")
+        fi
+
+        echo "GitHub API HTTP Status Code: ${HTTP_STATUS}"
+        echo "Response Body:"
+        cat /tmp/api_response.json
+        echo ""
+
+        if [ "${HTTP_STATUS}" -ge 400 ]; then
+          echo "Failed to post/update comment to GitHub PR API."
+          exit 1
         fi
 
     - name: Fail workflow on non-PASS verdict
