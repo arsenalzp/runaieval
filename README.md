@@ -6,28 +6,31 @@ This action dynamically configures the evaluation suite and target endpoints bas
 
 ## Features
 
-- Dynamic Routing via PR Labels: Automatically switch between RAG and AI Agent testing, and select specific evaluation suites just by applying labels to a Pull Request.
-- Kubernetes Native: Deploys and monitors an EvalRun Custom Resource Definition (CRD) directly in your cluster.
-- Automated Polling and Timeout: Waits up to 25 minutes for the evaluation to complete, tracking the phase and verdict in real-time.
-- Rich Reporting: Publishes a Markdown summary with execution status, root causes, and artifact URLs directly to the GitHub Actions UI.
-- CI/CD Enforcer: Fails the workflow if the AI evaluation verdict is anything other than PASS.
+- **Dynamic Routing via PR Labels:** Automatically switch between RAG and AI Agent testing, and select specific evaluation suites just by applying or updating labels on a Pull Request.
+- **Kubernetes Native:** Deploys and monitors an EvalRun Custom Resource Definition (CRD) directly in your cluster.
+- **Automated Polling and Timeout:** Waits for the evaluation to complete, tracking the phase and verdict in real-time.
+- **Rich Reporting:** Publishes a Markdown summary with execution status, root causes, and artifact URLs directly to the GitHub Actions UI.
+- **CI/CD Enforcer:** Fails the workflow if the AI evaluation verdict is anything other than PASS.
 
 ## Prerequisites
 
 Since this action interacts with a Kubernetes cluster, it is designed to run on a self-hosted runner (e.g., ARC - Actions Runner Controller) with the following tools installed:
-- kubectl (configured with RBAC permissions to create/read EvalRun resources)
-- jq (for JSON processing)
-- envsubst (usually available via the gettext package)
+- `kubectl` (configured with RBAC permissions to create/read EvalRun resources)
+- `jq` (for JSON processing)
+- `envsubst` (usually available via the `gettext` package)
 
-## Usage
+## Usage & PR Label Integration
 
-Create a workflow file in your repository (e.g., .github/workflows/ai-eval.yml):
+> **Important:** To enable dynamic configuration via PR labels, make sure your workflow includes `labeled` (and optionally `unlabeled`) under `on.pull_request.types`.
+
+Create a workflow file in your repository (e.g., `.github/workflows/ai-eval.yml`):
 
 ```yaml
 name: AI Evaluation Gate
+
 on: 
   pull_request:
-    types: [opened, labeled, synchronize]
+    types: [opened, synchronize, reopened, labeled] # 'labeled' is required to trigger re-evaluations when PR labels change
   workflow_dispatch:
 
 jobs:
