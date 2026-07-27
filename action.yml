@@ -254,7 +254,7 @@ runs:
       if: github.event_name == 'pull_request' && always()
       shell: bash
       env:
-        GH_TOKEN: ${{ github.token }}
+        GITHUB_TOKEN: ${{ github.token }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REPO: ${{ github.repository }}
         EVALRUN_NAME: ${{ steps.ctx.outputs.evalrun_name }}
@@ -266,10 +266,10 @@ runs:
         REPORT_URL: ${{ steps.result.outputs.report_url }}
         SUMMARY_URL: ${{ steps.result.outputs.summary_url }}
         RAW_RESULTS_URL: ${{ steps.result.outputs.raw_results_url }}
+        GIT_SHA: ${{ github.sha }}
       run: |
         set -euo pipefail
 
-        # Visual indicator badge based on verdict
         if [ "${VERDICT}" = "PASS" ]; then
           BADGE="🟢 **PASS**"
         elif [ "${VERDICT}" = "FAIL" ]; then
@@ -278,10 +278,8 @@ runs:
           BADGE="⚠️ **${VERDICT:-UNKNOWN}**"
         fi
 
-        # Unique comment identifier for sticky behavior
         MARKER="<!-- id: ai-eval-gate-comment -->"
 
-        # Build comment body
         COMMENT_BODY=$(cat <<EOF
         ${MARKER}
         ## 🤖 AI / RAG Evaluation Gate Results
@@ -293,7 +291,7 @@ runs:
         | **EvalSuite** | \`${EVALSUITE_NAME}\` |
         | **Type** | \`${EVAL_TYPE}\` |
         | **EvalRun CR** | \`${EVALRUN_NAME}\` |
-        | **Commit** | \`${GITHUB_SHA::7}\` |
+        | **Commit** | \`${GIT_SHA:0:7}\` |
 
         $( [ -n "${ROOT_CAUSE}" ] && [ "${ROOT_CAUSE}" != "null" ] && echo "### ⚠️ Root Cause Failure Analysis
         \`\`\`
@@ -307,18 +305,28 @@ runs:
         EOF
         )
 
-        # Find existing comment ID
-        EXISTING_COMMENT_ID=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
-          --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -n 1)
+        PAYLOAD=$(jq -n --arg body "$COMMENT_BODY" '{body: $body}')
 
-        if [ -n "${EXISTING_COMMENT_ID}" ]; then
+        # Find existing comment ID using curl + jq
+        EXISTING_COMMENT_ID=$(curl -s -S -H "Authorization: token ${GITHUB_TOKEN}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" \
+          | jq -r ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -n 1)
+
+        if [ -n "${EXISTING_COMMENT_ID}" ] && [ "${EXISTING_COMMENT_ID}" != "null" ]; then
           echo "Updating existing PR comment (ID: ${EXISTING_COMMENT_ID})..."
-          gh api -X PATCH "repos/${REPO}/issues/comments/${EXISTING_COMMENT_ID}" \
-            -f body="${COMMENT_BODY}" >/dev/null
+          curl -s -S -X PATCH \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -d "${PAYLOAD}" \
+            "https://api.github.com/repos/${REPO}/issues/comments/${EXISTING_COMMENT_ID}" > /dev/null
         else
           echo "Creating new PR comment..."
-          gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
-            -f body="${COMMENT_BODY}" >/dev/null
+          curl -s -S -X POST \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -d "${PAYLOAD}" \
+            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" > /dev/null
         fi
 
     - name: Fail workflow on non-PASS verdict
