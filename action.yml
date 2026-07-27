@@ -214,6 +214,9 @@ runs:
         echo "phase=${PHASE}" >> "$GITHUB_OUTPUT"
         echo "verdict=${VERDICT}" >> "$GITHUB_OUTPUT"
         echo "root_cause=${ROOT_CAUSE}" >> "$GITHUB_OUTPUT"
+        echo "report_url=${REPORT_URL}" >> "$GITHUB_OUTPUT"
+        echo "summary_url=${SUMMARY_URL}" >> "$GITHUB_OUTPUT"
+        echo "raw_results_url=${RAW_RESULTS_URL}" >> "$GITHUB_OUTPUT"
 
         {
           echo "## EvalRun AI / RAG Gate"
@@ -246,6 +249,77 @@ runs:
           echo "- Runner pod executed evaluation and uploaded artifacts to object storage."
           echo "- EvalRun.status exposed the release decision."
         } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Post or Update PR Comment
+      if: github.event_name == 'pull_request' && always()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+        EVALRUN_NAME: ${{ steps.ctx.outputs.evalrun_name }}
+        EVALSUITE_NAME: ${{ steps.ctx.outputs.evalsuite_name }}
+        EVAL_TYPE: ${{ steps.evaltype.outputs.type }}
+        PHASE: ${{ steps.result.outputs.phase }}
+        VERDICT: ${{ steps.result.outputs.verdict }}
+        ROOT_CAUSE: ${{ steps.result.outputs.root_cause }}
+        REPORT_URL: ${{ steps.result.outputs.report_url }}
+        SUMMARY_URL: ${{ steps.result.outputs.summary_url }}
+        RAW_RESULTS_URL: ${{ steps.result.outputs.raw_results_url }}
+      run: |
+        set -euo pipefail
+
+        # Visual indicator badge based on verdict
+        if [ "${VERDICT}" = "PASS" ]; then
+          BADGE="🟢 **PASS**"
+        elif [ "${VERDICT}" = "FAIL" ]; then
+          BADGE="🔴 **FAIL**"
+        else
+          BADGE="⚠️ **${VERDICT:-UNKNOWN}**"
+        fi
+
+        # Unique comment identifier for sticky behavior
+        MARKER="<!-- id: ai-eval-gate-comment -->"
+
+        # Build comment body
+        COMMENT_BODY=$(cat <<EOF
+        ${MARKER}
+        ## 🤖 AI / RAG Evaluation Gate Results
+
+        | Parameter | Value |
+        | :--- | :--- |
+        | **Status / Phase** | \`${PHASE:-UNKNOWN}\` |
+        | **Verdict** | ${BADGE} |
+        | **EvalSuite** | \`${EVALSUITE_NAME}\` |
+        | **Type** | \`${EVAL_TYPE}\` |
+        | **EvalRun CR** | \`${EVALRUN_NAME}\` |
+        | **Commit** | \`${GITHUB_SHA::7}\` |
+
+        $( [ -n "${ROOT_CAUSE}" ] && [ "${ROOT_CAUSE}" != "null" ] && echo "### ⚠️ Root Cause Failure Analysis
+        \`\`\`
+        ${ROOT_CAUSE}
+        \`\`\`" )
+
+        ### 📊 Evaluation Artifacts
+        - **Full HTML Report:** ${REPORT_URL:-N/A}
+        - **Gate Summary:** ${SUMMARY_URL:-N/A}
+        - **Raw JSON Results:** ${RAW_RESULTS_URL:-N/A}
+        EOF
+        )
+
+        # Find existing comment ID
+        EXISTING_COMMENT_ID=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+          --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -n 1)
+
+        if [ -n "${EXISTING_COMMENT_ID}" ]; then
+          echo "Updating existing PR comment (ID: ${EXISTING_COMMENT_ID})..."
+          gh api -X PATCH "repos/${REPO}/issues/comments/${EXISTING_COMMENT_ID}" \
+            -f body="${COMMENT_BODY}" >/dev/null
+        else
+          echo "Creating new PR comment..."
+          gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            -f body="${COMMENT_BODY}" >/dev/null
+        fi
 
     - name: Fail workflow on non-PASS verdict
       shell: bash
