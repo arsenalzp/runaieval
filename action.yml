@@ -30,68 +30,82 @@ inputs:
 runs:
   using: "composite"
   steps:
+    # Values coming from the event (PR labels) and from inputs are passed through env, never
+    # interpolated into the script text, so a label such as  x'; rm -rf ~; '  cannot inject shell.
     - name: Set evaluation suite
       id: evalsuite
       shell: bash
+      env:
+        DEFAULT_EVALSUITE: ${{ inputs.default_evalsuite }}
+        LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
       run: |
-        EVALSUITE="${{ inputs.default_evalsuite }}"
-        
-        LABELS_JSON='${{ toJson(github.event.pull_request.labels.*.name) }}'
-        # Cut out the prefix "evalsuite:" (e.g., "evalsuite:demo-suite-2q-pass" -> "demo-suite-2q-pass")
-        FOUND_LABEL=$(echo "$LABELS_JSON" | jq -r '.[] | select(startswith("evalsuite:")) | sub("^evalsuite:"; "")' | head -n 1)
+        set -euo pipefail
+        EVALSUITE="${DEFAULT_EVALSUITE}"
 
-        if [ -n "$FOUND_LABEL" ]; then
+        # Cut out the prefix "evalsuite:" (e.g., "evalsuite:demo-suite-2q-pass" -> "demo-suite-2q-pass")
+        FOUND_LABEL="$(jq -r '(. // [])[] | select(startswith("evalsuite:")) | sub("^evalsuite:"; "")' <<<"${LABELS_JSON:-[]}" | head -n 1)"
+
+        if [ -n "${FOUND_LABEL}" ]; then
           EVALSUITE="${FOUND_LABEL}"
         fi
-        
-        echo "name=$EVALSUITE" >> $GITHUB_OUTPUT
-    
+
+        echo "name=${EVALSUITE}" >> "$GITHUB_OUTPUT"
+
     - name: Set evaluation type
       id: evaltype
       shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
       run: |
+        set -euo pipefail
         # Default type is RAG
         EVAL_TYPE="rag"
 
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          LABELS_JSON='${{ toJson(github.event.pull_request.labels.*.name) }}'
-          IS_AGENT=$(echo "$LABELS_JSON" | jq -r '.[] | select(. == "type:agent" or . == "agent")' | head -n 1)
-
-          if [ -n "$IS_AGENT" ]; then
+        if [ "${EVENT_NAME}" = "pull_request" ]; then
+          IS_AGENT="$(jq -r '(. // [])[] | select(. == "type:agent" or . == "agent")' <<<"${LABELS_JSON:-[]}" | head -n 1)"
+          if [ -n "${IS_AGENT}" ]; then
             EVAL_TYPE="agent"
           fi
         fi
 
-        echo "Selected eval type: $EVAL_TYPE"
-        echo "type=$EVAL_TYPE" >> "$GITHUB_OUTPUT"
+        echo "Selected eval type: ${EVAL_TYPE}"
+        echo "type=${EVAL_TYPE}" >> "$GITHUB_OUTPUT"
 
     - name: Resolve EvalRun context
       id: ctx
       shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        PR_NUMBER_EVENT: ${{ github.event.pull_request.number }}
+        RUN_NUMBER: ${{ github.run_number }}
+        EVALSUITE_NAME: ${{ steps.evalsuite.outputs.name }}
+        EVAL_TYPE: ${{ steps.evaltype.outputs.type }}
+        NAMESPACE: ${{ inputs.default_namespace }}
+        TEMPLATE_PATH_RAG: ${{ inputs.template_path_rag }}
+        TEMPLATE_PATH_AGENT: ${{ inputs.template_path_agent }}
+        ENDPOINT_RAG: ${{ inputs.endpoint_rag }}
+        ENDPOINT_AGENT: ${{ inputs.endpoint_agent }}
+        GIT_SHA: ${{ github.sha }}
       run: |
         set -euo pipefail
 
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          EVALRUN_NAME="pr-${{ github.event.pull_request.number }}-ai-eval"
-          EVALSUITE_NAME="${{ steps.evalsuite.outputs.name }}"
-          NAMESPACE="${{ inputs.default_namespace }}"
-          PR_NUMBER="${{ github.event.pull_request.number }}"
-          EVAL_TYPE="${{ steps.evaltype.outputs.type }}"
+        if [ "${EVENT_NAME}" = "pull_request" ]; then
+          EVALRUN_NAME="pr-${PR_NUMBER_EVENT}-ai-eval"
+          PR_NUMBER="${PR_NUMBER_EVENT}"
           FAIL_ON_EVAL_FAIL="true"
 
-          if [ "$EVAL_TYPE" = "agent" ]; then
-            TEMPLATE_PATH="${{ inputs.template_path_agent }}"
-            TARGET_ENDPOINT="${{ inputs.endpoint_agent }}"
+          if [ "${EVAL_TYPE}" = "agent" ]; then
+            TEMPLATE_PATH="${TEMPLATE_PATH_AGENT}"
+            TARGET_ENDPOINT="${ENDPOINT_AGENT}"
           else
-            TEMPLATE_PATH="${{ inputs.template_path_rag }}"
-            TARGET_ENDPOINT="${{ inputs.endpoint_rag }}"
+            TEMPLATE_PATH="${TEMPLATE_PATH_RAG}"
+            TARGET_ENDPOINT="${ENDPOINT_RAG}"
           fi
         else
-          EVALRUN_NAME="manual-ai-eval-${{ github.run_number }}"
-          EVALSUITE_NAME="${{ steps.evalsuite.outputs.name }}"
-          NAMESPACE="${{ inputs.default_namespace }}"
-          TEMPLATE_PATH="${{ inputs.template_path_rag }}"
-          TARGET_ENDPOINT="${{ inputs.endpoint_rag }}"
+          EVALRUN_NAME="manual-ai-eval-${RUN_NUMBER}"
+          TEMPLATE_PATH="${TEMPLATE_PATH_RAG}"
+          TARGET_ENDPOINT="${ENDPOINT_RAG}"
           PR_NUMBER="0"
           FAIL_ON_EVAL_FAIL="true"
         fi
@@ -102,24 +116,36 @@ runs:
           | sed 's/--*/-/g' \
           | sed 's/^-//;s/-$//')"
 
-        echo "evalrun_name=${EVALRUN_NAME}" >> "$GITHUB_OUTPUT"
-        echo "evalsuite_name=${EVALSUITE_NAME}" >> "$GITHUB_OUTPUT"
-        echo "namespace=${NAMESPACE}" >> "$GITHUB_OUTPUT"
-        echo "template_path=${TEMPLATE_PATH}" >> "$GITHUB_OUTPUT"
-        echo "target_endpoint=${TARGET_ENDPOINT}" >> "$GITHUB_OUTPUT"
-        echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
-        echo "fail_on_eval_fail=${FAIL_ON_EVAL_FAIL}" >> "$GITHUB_OUTPUT"
+        {
+          echo "evalrun_name=${EVALRUN_NAME}"
+          echo "evalsuite_name=${EVALSUITE_NAME}"
+          echo "namespace=${NAMESPACE}"
+          echo "template_path=${TEMPLATE_PATH}"
+          echo "target_endpoint=${TARGET_ENDPOINT}"
+          echo "pr_number=${PR_NUMBER}"
+          echo "fail_on_eval_fail=${FAIL_ON_EVAL_FAIL}"
+        } >> "$GITHUB_OUTPUT"
 
         echo "EvalRun: ${EVALRUN_NAME}"
         echo "EvalSuite: ${EVALSUITE_NAME}"
         echo "Namespace: ${NAMESPACE}"
         echo "Template: ${TEMPLATE_PATH}"
         echo "Target Endpoint: ${TARGET_ENDPOINT}"
-        echo "Commit: ${{ github.sha }}"
+        echo "Commit: ${GIT_SHA}"
 
     - name: Kubernetes RBAC checks
       shell: bash
-      run: kubectl auth can-i create evalrun
+      env:
+        NAMESPACE: ${{ steps.ctx.outputs.namespace }}
+      run: |
+        set -euo pipefail
+        # Check the namespace the EvalRun is created in, not the kubeconfig's current one.
+        for verb in create get patch; do
+          if ! kubectl auth can-i "${verb}" evalruns.ai.evaluation.io -n "${NAMESPACE}" >/dev/null; then
+            echo "::error::The runner identity cannot '${verb}' evalruns in namespace ${NAMESPACE}"
+            exit 1
+          fi
+        done
 
     - name: Render EvalRun from template
       shell: bash
@@ -153,35 +179,53 @@ runs:
         cat evalrun.yaml
 
     - name: Create EvalRun
+      id: apply
       shell: bash
+      env:
+        NAMESPACE: ${{ steps.ctx.outputs.namespace }}
       run: |
         set -euo pipefail
 
-        kubectl apply -f evalrun.yaml
+        # Remember which spec generation THIS workflow applied. Re-applying the same EvalRun with a new
+        # gitSHA bumps metadata.generation; the controller then re-evaluates, and only a status whose
+        # observedGeneration equals this value describes this commit.
+        GENERATION="$(kubectl apply -n "${NAMESPACE}" -f evalrun.yaml -o jsonpath='{.metadata.generation}')"
+        echo "Applied EvalRun at generation ${GENERATION}"
+        echo "generation=${GENERATION}" >> "$GITHUB_OUTPUT"
 
     - name: Wait for EvalRun completion
       shell: bash
       env:
         EVALRUN_NAME: ${{ steps.ctx.outputs.evalrun_name }}
         NAMESPACE: ${{ steps.ctx.outputs.namespace }}
-        EVALRUN_RESOURCE: "EvalRun"
+        APPLIED_GENERATION: ${{ steps.apply.outputs.generation }}
       run: |
         set -euo pipefail
 
-        echo "Waiting for EvalRun/${EVALRUN_NAME} in namespace ${NAMESPACE}"
+        echo "Waiting for EvalRun/${EVALRUN_NAME} (generation ${APPLIED_GENERATION}) in namespace ${NAMESPACE}"
 
         DEADLINE_SECONDS=1500
         INTERVAL_SECONDS=10
         ELAPSED=0
 
         while [ "${ELAPSED}" -lt "${DEADLINE_SECONDS}" ]; do
-          PHASE="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-          VERDICT="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.verdict}' 2>/dev/null || true)"
-          STAGE="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.rootCause.stage}' 2>/dev/null || true)"
+          JSON="$(kubectl -n "${NAMESPACE}" get evalruns.ai.evaluation.io "${EVALRUN_NAME}" -o json 2>/dev/null || echo '{}')"
+          GEN="$(jq -r '.metadata.generation // empty' <<<"${JSON}")"
+          OBSERVED="$(jq -r '.status.observedGeneration // 0' <<<"${JSON}")"
+          PHASE="$(jq -r '.status.phase // empty' <<<"${JSON}")"
+          VERDICT="$(jq -r '.status.verdict // empty' <<<"${JSON}")"
+          STAGE="$(jq -r '.status.rootCause.stage // empty' <<<"${JSON}")"
 
-          echo "elapsed=${ELAPSED}s phase=${PHASE:-<empty>} verdict=${VERDICT:-<empty>} stage=${STAGE:-<empty>}"
+          echo "elapsed=${ELAPSED}s generation=${GEN:-?} observed=${OBSERVED} phase=${PHASE:-<empty>} verdict=${VERDICT:-<empty>} stage=${STAGE:-<empty>}"
 
-          if [ "${PHASE}" = "COMPLETED" ] || [ "${PHASE}" = "FAILED" ]; then
+          # A newer push re-applied the same EvalRun: this commit's result will never be reported.
+          if [ -n "${GEN}" ] && [ "${GEN}" -gt "${APPLIED_GENERATION}" ]; then
+            echo "::error::EvalRun/${EVALRUN_NAME} was superseded by a newer apply (generation ${GEN} > ${APPLIED_GENERATION})"
+            exit 1
+          fi
+
+          # Ignore the status of an earlier generation (the controller has not reset it yet).
+          if [ "${OBSERVED}" = "${APPLIED_GENERATION}" ] && { [ "${PHASE}" = "COMPLETED" ] || [ "${PHASE}" = "FAILED" ]; }; then
             exit 0
           fi
 
@@ -190,6 +234,7 @@ runs:
         done
 
         echo "Timed out waiting for EvalRun/${EVALRUN_NAME}"
+        echo "If status.observedGeneration never appears, the controller predates re-evaluation support: upgrade it."
         exit 1
 
     - name: Read EvalRun result
@@ -198,25 +243,48 @@ runs:
       env:
         EVALRUN_NAME: ${{ steps.ctx.outputs.evalrun_name }}
         NAMESPACE: ${{ steps.ctx.outputs.namespace }}
-        EVALRUN_RESOURCE: "EvalRun"
+        GIT_SHA: ${{ github.sha }}
       run: |
         set -euo pipefail
 
-        PHASE="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-        VERDICT="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.verdict}' 2>/dev/null || true)"
-        ROOT_CAUSE="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.rootCause.stage}' 2>/dev/null || true)"
-        SUMMARY="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.summary}' 2>/dev/null || true)"
+        JSON="$(kubectl -n "${NAMESPACE}" get evalruns.ai.evaluation.io "${EVALRUN_NAME}" -o json 2>/dev/null || echo '{}')"
+        field() { jq -r "$1 // empty" <<<"${JSON}"; }
 
-        REPORT_URL="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.artifacts.scoresUri}' 2>/dev/null || true)"
-        SUMMARY_URL="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.artifacts.gateSummaryUri}' 2>/dev/null || true)"
-        RAW_RESULTS_URL="$(kubectl -n "${NAMESPACE}" get "${EVALRUN_RESOURCE}" "${EVALRUN_NAME}" -o jsonpath='{.status.artifacts.detailsUri}' 2>/dev/null || true)"
+        PHASE="$(field .status.phase)"
+        VERDICT="$(field .status.verdict)"
+        ROOT_CAUSE="$(field .status.rootCause.stage)"
+        SUMMARY="$(field .status.summary)"
+        # Human-readable root cause: stage plus whatever the runner reported (code, metric, case, turn, values).
+        ROOT_CAUSE_DETAILS="$(jq -r '
+          (.status.rootCause // {}) as $rc
+          | [ ($rc.stage // empty | "stage: \(.)"),
+              ($rc.code // empty | "code: \(.)"),
+              ($rc.metric // empty | "metric: \(.)"),
+              ($rc.evaluator // empty | "evaluator: \(.)"),
+              ($rc.caseId // empty | "case: \(.)"),
+              ($rc.turnIndex // empty | "turn: \(.)"),
+              ($rc.observed // empty | "observed: \(.)"),
+              ($rc.required // empty | "required: \(.)"),
+              ($rc.details // empty | "details: \(.)"),
+              ($rc.artifactUri // empty | "evidence: \(.)") ]
+          | join("\n")' <<<"${JSON}")"
 
-        echo "phase=${PHASE}" >> "$GITHUB_OUTPUT"
-        echo "verdict=${VERDICT}" >> "$GITHUB_OUTPUT"
-        echo "root_cause=${ROOT_CAUSE}" >> "$GITHUB_OUTPUT"
-        echo "report_url=${REPORT_URL}" >> "$GITHUB_OUTPUT"
-        echo "summary_url=${SUMMARY_URL}" >> "$GITHUB_OUTPUT"
-        echo "raw_results_url=${RAW_RESULTS_URL}" >> "$GITHUB_OUTPUT"
+        REPORT_URL="$(field .status.artifacts.scoresUri)"
+        SUMMARY_URL="$(field .status.artifacts.gateSummaryUri)"
+        RAW_RESULTS_URL="$(field .status.artifacts.detailsUri)"
+
+        {
+          echo "phase=${PHASE}"
+          echo "verdict=${VERDICT}"
+          echo "root_cause=${ROOT_CAUSE}"
+          echo "report_url=${REPORT_URL}"
+          echo "summary_url=${SUMMARY_URL}"
+          echo "raw_results_url=${RAW_RESULTS_URL}"
+          # Multi-line value: GitHub's heredoc output syntax.
+          echo "root_cause_details<<__RC_EOF__"
+          echo "${ROOT_CAUSE_DETAILS}"
+          echo "__RC_EOF__"
+        } >> "$GITHUB_OUTPUT"
 
         {
           echo "## EvalRun AI / RAG Gate"
@@ -228,11 +296,19 @@ runs:
           echo "| Phase | \`${PHASE:-unknown}\` |"
           echo "| Verdict | \`${VERDICT:-unknown}\` |"
           echo "| Root cause | \`${ROOT_CAUSE:-n/a}\` |"
-          echo "| Commit | \`${{ github.sha }}\` |"
+          echo "| Commit | \`${GIT_SHA}\` |"
           echo ""
           echo "### Summary"
           echo ""
           echo "${SUMMARY:-No summary reported.}"
+          if [ -n "${ROOT_CAUSE_DETAILS}" ] && [ "${ROOT_CAUSE:-None}" != "None" ]; then
+            echo ""
+            echo "### Root cause"
+            echo ""
+            echo '```'
+            echo "${ROOT_CAUSE_DETAILS}"
+            echo '```'
+          fi
           echo ""
           echo "### Artifacts"
           echo ""
@@ -254,6 +330,7 @@ runs:
         PHASE: ${{ steps.result.outputs.phase }}
         VERDICT: ${{ steps.result.outputs.verdict }}
         ROOT_CAUSE: ${{ steps.result.outputs.root_cause }}
+        ROOT_CAUSE_DETAILS: ${{ steps.result.outputs.root_cause_details }}
         REPORT_URL: ${{ steps.result.outputs.report_url }}
         SUMMARY_URL: ${{ steps.result.outputs.summary_url }}
         RAW_RESULTS_URL: ${{ steps.result.outputs.raw_results_url }}
@@ -275,7 +352,7 @@ runs:
         if [ -n "${ROOT_CAUSE:-}" ] && [ "${ROOT_CAUSE}" != "null" ] && [ "${ROOT_CAUSE}" != "None" ]; then
           ROOT_CAUSE_SECTION="### ⚠️ Root Cause Failure Analysis
         \`\`\`
-        ${ROOT_CAUSE}
+        ${ROOT_CAUSE_DETAILS:-${ROOT_CAUSE}}
         \`\`\`"
         fi
 
@@ -302,25 +379,26 @@ runs:
         )
 
         PAYLOAD=$(jq -n --arg body "$COMMENT_BODY" '{body: $body}')
+        API_RESPONSE="${RUNNER_TEMP:-/tmp}/ai-eval-gate-api-response.json"
 
         echo "Checking for existing PR comment..."
         RESPONSE=$(curl -s -S \
           -H "Authorization: Bearer ${GITHUB_TOKEN}" \
           -H "Accept: application/vnd.github.v3+json" \
-          "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments")
+          "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100")
 
         EXISTING_COMMENT_ID=$(echo "$RESPONSE" | jq -r --arg marker "$MARKER" 'if type=="array" then (.[] | select(.body | contains($marker)) | .id) else empty end' | head -n 1)
 
         if [ -n "${EXISTING_COMMENT_ID:-}" ] && [ "${EXISTING_COMMENT_ID}" != "null" ]; then
           echo "Updating existing PR comment (ID: ${EXISTING_COMMENT_ID})..."
-          HTTP_STATUS=$(curl -s -o /tmp/api_response.json -w "%{http_code}" -X PATCH \
+          HTTP_STATUS=$(curl -s -o "${API_RESPONSE}" -w "%{http_code}" -X PATCH \
             -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github.v3+json" \
             -d "${PAYLOAD}" \
             "https://api.github.com/repos/${REPO}/issues/comments/${EXISTING_COMMENT_ID}")
         else
           echo "Creating new PR comment..."
-          HTTP_STATUS=$(curl -s -o /tmp/api_response.json -w "%{http_code}" -X POST \
+          HTTP_STATUS=$(curl -s -o "${API_RESPONSE}" -w "%{http_code}" -X POST \
             -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github.v3+json" \
             -d "${PAYLOAD}" \
@@ -329,12 +407,13 @@ runs:
 
         echo "GitHub API HTTP Status Code: ${HTTP_STATUS}"
         echo "Response Body:"
-        cat /tmp/api_response.json
+        cat "${API_RESPONSE}"
         echo ""
 
+        # The gate verdict is decided by the next step; a comment that cannot be written (e.g. the read-only
+        # token of a fork PR, or missing pull-requests: write) must not turn a PASS into a failed job.
         if [ "${HTTP_STATUS}" -ge 400 ]; then
-          echo "Failed to post/update comment to GitHub PR API."
-          exit 1
+          echo "::warning::Could not post/update the PR comment (HTTP ${HTTP_STATUS}). Grant 'pull-requests: write'; fork PRs have a read-only token. The verdict is in the job summary."
         fi
 
     - name: Fail workflow on non-PASS verdict
