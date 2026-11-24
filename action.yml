@@ -1,15 +1,33 @@
 name: "AI Agents and RAG-system CI/CD gate"
 description: "Renders, applies, and monitors Kubernetes EvalRun CRD for AI Agents and RAG evaluation"
 
+# Requires an EvalRun controller with EvalRun.spec.llm and status.observedGeneration support.
+#
+# The EvalRun template is chosen from the EvalSuite (no PR label needed):
+#   spec.execution.mode == dummy                      -> evalrun-agent-deterministic (no LLM)
+#   MultiTurn suite with a deepeval evaluator          -> evalrun-agent (judge LLM, no embedder)
+#   MultiTurn suite without a deepeval evaluator       -> evalrun-agent-deterministic (no LLM)
+#   single-turn agent suite (spec.metrics.agent)       -> evalrun-agent (judge LLM, no embedder)
+#   RAG suite (spec.metrics.rag)                       -> evalrun-rag (judge LLM + embedder)
+# These are the same rules the controller enforces (suiteLLMUse); a mismatch would leave the EvalRun PENDING (LLMInvalid).
+#
+# Templates are rendered with envsubst; only these variables are substituted:
+#   EVALRUN_NAME NAMESPACE EVALSUITE_NAME TARGET_ENDPOINT PR_NUMBER GIT_SHA SUMMARY_BUCKET
+#   LLM_MODEL LLM_EMBEDDER LLM_CONNECTION GITHUB_REPOSITORY GITHUB_RUN_ID
+
 inputs:
   template_path_rag:
-    description: "Path to RAG EvalRun template"
+    description: "Custom RAG EvalRun template (path in the caller's repository). Empty = the action's built-in template"
     required: false
-    default: ".github/templates/evalrun-rag.yaml.tpl"
+    default: ""
   template_path_agent:
-    description: "Path to AI Agent EvalRun template"
+    description: "Custom template for agent suites with an LLM judge (caller's repository). Empty = built-in"
     required: false
-    default: ".github/templates/evalrun-agent.yaml.tpl"
+    default: ""
+  template_path_agent_deterministic:
+    description: "Custom template for suites without an LLM judge (caller's repository). Empty = built-in"
+    required: false
+    default: ""
   endpoint_rag:
     description: "Target endpoint for RAG testing"
     required: false
@@ -17,15 +35,39 @@ inputs:
   endpoint_agent:
     description: "Target endpoint for AI Agent testing"
     required: false
-    default: "http://k8s:8080/agent/invoke"
+    default: "http://k8s:8088/agent/run"
   default_namespace:
     description: "Kubernetes namespace"
     required: false
     default: "default"
   default_evalsuite:
-    description: "Default evaluation suite name"
+    description: "Default evaluation suite name (a PR label evalsuite:<name> overrides it)"
     required: false
     default: "demo-suite"
+  summary_bucket:
+    description: "Object-store bucket for the run artifacts (EvalRun.spec.summaryBucket)"
+    required: false
+    default: "eval-artifacts"
+  llm_model:
+    description: "Judge model (EvalRun.spec.llm.model). Required when the suite uses an LLM judge"
+    required: false
+    default: ""
+  llm_embedder:
+    description: "Embedding model for RAG suites (EvalRun.spec.llm.embedder). Required for RAG suites, not used by agent suites"
+    required: false
+    default: ""
+  llm_url:
+    description: "Base URL of an OpenAI-compatible server inside your perimeter (vLLM, Ollama, LiteLLM, ...). Empty = public OpenAI API"
+    required: false
+    default: ""
+  llm_api_key_secret:
+    description: "Name of the Kubernetes Secret (in the namespace) holding the judge API key. Required without llm_url"
+    required: false
+    default: ""
+  llm_api_key_secret_key:
+    description: "Key inside that Secret"
+    required: false
+    default: "apiKey"
 
 runs:
   using: "composite"
@@ -49,28 +91,72 @@ runs:
           EVALSUITE="${FOUND_LABEL}"
         fi
 
-        echo "name=${EVALSUITE}" >> "$GITHUB_OUTPUT"
-
-    - name: Set evaluation type
-      id: evaltype
-      shell: bash
-      env:
-        EVENT_NAME: ${{ github.event_name }}
-        LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
-      run: |
-        set -euo pipefail
-        # Default type is RAG
-        EVAL_TYPE="rag"
-
-        if [ "${EVENT_NAME}" = "pull_request" ]; then
-          IS_AGENT="$(jq -r '(. // [])[] | select(. == "type:agent" or . == "agent")' <<<"${LABELS_JSON:-[]}" | head -n 1)"
-          if [ -n "${IS_AGENT}" ]; then
-            EVAL_TYPE="agent"
-          fi
+        # A Kubernetes object name; anything else would also be unsafe to render into YAML.
+        if ! [[ "${EVALSUITE}" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]]; then
+          echo "::error::Invalid EvalSuite name '${EVALSUITE}' (must be a Kubernetes object name)"
+          exit 1
         fi
 
-        echo "Selected eval type: ${EVAL_TYPE}"
-        echo "type=${EVAL_TYPE}" >> "$GITHUB_OUTPUT"
+        echo "name=${EVALSUITE}" >> "$GITHUB_OUTPUT"
+
+    - name: Kubernetes RBAC checks
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.default_namespace }}
+      run: |
+        set -euo pipefail
+        # Check the namespace the EvalRun is created in, not the kubeconfig's current one.
+        for check in "create evalruns" "get evalruns" "patch evalruns" "get evalsuites"; do
+          set -- ${check}
+          if ! kubectl auth can-i "$1" "$2.ai.evaluation.io" -n "${NAMESPACE}" >/dev/null; then
+            echo "::error::The runner identity cannot '$1' $2 in namespace ${NAMESPACE}"
+            exit 1
+          fi
+        done
+
+    - name: Classify EvalSuite
+      id: suite
+      shell: bash
+      env:
+        EVALSUITE_NAME: ${{ steps.evalsuite.outputs.name }}
+        NAMESPACE: ${{ inputs.default_namespace }}
+      run: |
+        set -euo pipefail
+
+        if ! SUITE_JSON="$(kubectl -n "${NAMESPACE}" get evalsuites.ai.evaluation.io "${EVALSUITE_NAME}" -o json)"; then
+          echo "::error::EvalSuite '${EVALSUITE_NAME}' not found in namespace ${NAMESPACE}"
+          exit 1
+        fi
+
+        # kind: which endpoint is tested; llm: what the suite's runner calls (mirrors the controller's suiteLLMUse).
+        read -r KIND LLM_USE < <(jq -r '
+          .spec as $s
+          | (if $s.metrics.agent then "agent" elif $s.metrics.rag then "rag" else "none" end) as $kind
+          | (if ($s.execution.mode // "") == "dummy" then "none"
+             elif ($s.evaluation.interactionMode // "") == "MultiTurn"
+               then (if any(($s.evaluators // [])[]; .provider == "deepeval") then "judge" else "none" end)
+             elif $kind == "agent" then "judge"
+             elif $kind == "rag" then "judge+embedder"
+             else "none" end) as $llm
+          | "\($kind) \($llm)"' <<<"${SUITE_JSON}")
+
+        if [ "${KIND}" = "none" ]; then
+          echo "::error::EvalSuite '${EVALSUITE_NAME}' has neither spec.metrics.rag nor spec.metrics.agent"
+          exit 1
+        fi
+
+        case "${LLM_USE}" in
+          judge+embedder) TEMPLATE="rag" ;;
+          judge)          TEMPLATE="agent" ;;
+          none)           TEMPLATE="agent-deterministic" ;;
+        esac
+
+        echo "EvalSuite ${EVALSUITE_NAME}: kind=${KIND} llm=${LLM_USE} template=${TEMPLATE}"
+        {
+          echo "kind=${KIND}"
+          echo "llm=${LLM_USE}"
+          echo "template=${TEMPLATE}"
+        } >> "$GITHUB_OUTPUT"
 
     - name: Resolve EvalRun context
       id: ctx
@@ -80,10 +166,12 @@ runs:
         PR_NUMBER_EVENT: ${{ github.event.pull_request.number }}
         RUN_NUMBER: ${{ github.run_number }}
         EVALSUITE_NAME: ${{ steps.evalsuite.outputs.name }}
-        EVAL_TYPE: ${{ steps.evaltype.outputs.type }}
+        EVAL_KIND: ${{ steps.suite.outputs.kind }}
+        TEMPLATE: ${{ steps.suite.outputs.template }}
         NAMESPACE: ${{ inputs.default_namespace }}
         TEMPLATE_PATH_RAG: ${{ inputs.template_path_rag }}
         TEMPLATE_PATH_AGENT: ${{ inputs.template_path_agent }}
+        TEMPLATE_PATH_AGENT_DETERMINISTIC: ${{ inputs.template_path_agent_deterministic }}
         ENDPOINT_RAG: ${{ inputs.endpoint_rag }}
         ENDPOINT_AGENT: ${{ inputs.endpoint_agent }}
         GIT_SHA: ${{ github.sha }}
@@ -93,21 +181,25 @@ runs:
         if [ "${EVENT_NAME}" = "pull_request" ]; then
           EVALRUN_NAME="pr-${PR_NUMBER_EVENT}-ai-eval"
           PR_NUMBER="${PR_NUMBER_EVENT}"
-          FAIL_ON_EVAL_FAIL="true"
-
-          if [ "${EVAL_TYPE}" = "agent" ]; then
-            TEMPLATE_PATH="${TEMPLATE_PATH_AGENT}"
-            TARGET_ENDPOINT="${ENDPOINT_AGENT}"
-          else
-            TEMPLATE_PATH="${TEMPLATE_PATH_RAG}"
-            TARGET_ENDPOINT="${ENDPOINT_RAG}"
-          fi
         else
           EVALRUN_NAME="manual-ai-eval-${RUN_NUMBER}"
-          TEMPLATE_PATH="${TEMPLATE_PATH_RAG}"
-          TARGET_ENDPOINT="${ENDPOINT_RAG}"
           PR_NUMBER="0"
-          FAIL_ON_EVAL_FAIL="true"
+        fi
+        FAIL_ON_EVAL_FAIL="true"
+
+        # Built-in templates live in the action's repository: a relative path would resolve against the caller's workspace.
+        BUILTIN="${GITHUB_ACTION_PATH}/.github/templates"
+        case "${TEMPLATE}" in
+          rag)                 TEMPLATE_PATH="${TEMPLATE_PATH_RAG:-${BUILTIN}/evalrun-rag.yaml.tpl}" ;;
+          agent)               TEMPLATE_PATH="${TEMPLATE_PATH_AGENT:-${BUILTIN}/evalrun-agent.yaml.tpl}" ;;
+          agent-deterministic) TEMPLATE_PATH="${TEMPLATE_PATH_AGENT_DETERMINISTIC:-${BUILTIN}/evalrun-agent-deterministic.yaml.tpl}" ;;
+          *) echo "::error::unknown template '${TEMPLATE}'"; exit 1 ;;
+        esac
+
+        if [ "${EVAL_KIND}" = "agent" ]; then
+          TARGET_ENDPOINT="${ENDPOINT_AGENT}"
+        else
+          TARGET_ENDPOINT="${ENDPOINT_RAG}"
         fi
 
         EVALRUN_NAME="$(echo "${EVALRUN_NAME}" \
@@ -133,20 +225,6 @@ runs:
         echo "Target Endpoint: ${TARGET_ENDPOINT}"
         echo "Commit: ${GIT_SHA}"
 
-    - name: Kubernetes RBAC checks
-      shell: bash
-      env:
-        NAMESPACE: ${{ steps.ctx.outputs.namespace }}
-      run: |
-        set -euo pipefail
-        # Check the namespace the EvalRun is created in, not the kubeconfig's current one.
-        for verb in create get patch; do
-          if ! kubectl auth can-i "${verb}" evalruns.ai.evaluation.io -n "${NAMESPACE}" >/dev/null; then
-            echo "::error::The runner identity cannot '${verb}' evalruns in namespace ${NAMESPACE}"
-            exit 1
-          fi
-        done
-
     - name: Render EvalRun from template
       shell: bash
       env:
@@ -156,14 +234,21 @@ runs:
         TEMPLATE_PATH: ${{ steps.ctx.outputs.template_path }}
         TARGET_ENDPOINT: ${{ steps.ctx.outputs.target_endpoint }}
         PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+        LLM_USE: ${{ steps.suite.outputs.llm }}
+        SUMMARY_BUCKET: ${{ inputs.summary_bucket }}
+        LLM_MODEL: ${{ inputs.llm_model }}
+        LLM_EMBEDDER: ${{ inputs.llm_embedder }}
+        LLM_URL: ${{ inputs.llm_url }}
+        LLM_API_KEY_SECRET: ${{ inputs.llm_api_key_secret }}
+        LLM_API_KEY_SECRET_KEY: ${{ inputs.llm_api_key_secret_key }}
         GIT_SHA: ${{ github.sha }}
         GITHUB_REPOSITORY: ${{ github.repository }}
-        GITHUB_WORKFLOW: ${{ github.workflow }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
       run: |
         set -euo pipefail
 
         if [ ! -f "${TEMPLATE_PATH}" ]; then
-          echo "Template not found: ${TEMPLATE_PATH}"
+          echo "::error::Template not found: ${TEMPLATE_PATH}"
           exit 1
         fi
 
@@ -173,7 +258,66 @@ runs:
           exit 1
         fi
 
-        envsubst < "${TEMPLATE_PATH}" > evalrun.yaml
+        # Values end up inside double-quoted YAML strings: refuse anything that could break out of them.
+        for name in TARGET_ENDPOINT SUMMARY_BUCKET LLM_MODEL LLM_EMBEDDER LLM_URL LLM_API_KEY_SECRET LLM_API_KEY_SECRET_KEY; do
+          value="${!name}"
+          if [[ "${value}" == *'"'* || "${value}" == *'\'* || "${value}" == *$'\n'* ]]; then
+            echo "::error::Input for ${name} must not contain quotes, backslashes or newlines"
+            exit 1
+          fi
+        done
+
+        # The suite decides which LLM fields are used; inputs it does not use are reported, not silently dropped.
+        LLM_CONNECTION=""
+        case "${LLM_USE}" in
+          none)
+            for name in LLM_MODEL LLM_EMBEDDER LLM_URL LLM_API_KEY_SECRET; do
+              if [ -n "${!name}" ]; then
+                echo "::notice::EvalSuite ${EVALSUITE_NAME} uses no LLM judge: input ${name} is not used for this run"
+              fi
+            done
+            ;;
+          judge|judge+embedder)
+            if [ -z "${LLM_MODEL}" ]; then
+              echo "::error::EvalSuite ${EVALSUITE_NAME} uses an LLM judge: set the input llm_model"
+              exit 1
+            fi
+            if [ "${LLM_USE}" = "judge+embedder" ] && [ -z "${LLM_EMBEDDER}" ]; then
+              echo "::error::RAG EvalSuite ${EVALSUITE_NAME} needs an embedding model: set the input llm_embedder"
+              exit 1
+            fi
+            if [ "${LLM_USE}" = "judge" ] && [ -n "${LLM_EMBEDDER}" ]; then
+              echo "::notice::EvalSuite ${EVALSUITE_NAME} is an agent suite: input llm_embedder is not used for this run"
+            fi
+            if [ -n "${LLM_URL}" ] && ! [[ "${LLM_URL}" =~ ^https?:// ]]; then
+              echo "::error::llm_url must start with http:// or https://, got '${LLM_URL}'"
+              exit 1
+            fi
+            if [ -z "${LLM_URL}" ] && [ -z "${LLM_API_KEY_SECRET}" ]; then
+              echo "::error::Set llm_api_key_secret (the public API needs a key) or llm_url (a server inside your perimeter)"
+              exit 1
+            fi
+            # Optional connection lines of spec.llm, indented for the templates (4 spaces under spec.llm).
+            if [ -n "${LLM_URL}" ]; then
+              LLM_CONNECTION+="    url: \"${LLM_URL}\""$'\n'
+            fi
+            if [ -n "${LLM_API_KEY_SECRET}" ]; then
+              LLM_CONNECTION+="    apiKeySecretRef:"$'\n'
+              LLM_CONNECTION+="      name: \"${LLM_API_KEY_SECRET}\""$'\n'
+              LLM_CONNECTION+="      key: \"${LLM_API_KEY_SECRET_KEY}\""$'\n'
+            fi
+            LLM_CONNECTION="${LLM_CONNECTION%$'\n'}"
+            ;;
+          *)
+            echo "::error::unknown LLM use '${LLM_USE}'"
+            exit 1
+            ;;
+        esac
+        export LLM_CONNECTION
+
+        # Substitute only the documented variables; any other $... in a template stays as written.
+        envsubst '${EVALRUN_NAME} ${NAMESPACE} ${EVALSUITE_NAME} ${TARGET_ENDPOINT} ${PR_NUMBER} ${GIT_SHA} ${SUMMARY_BUCKET} ${LLM_MODEL} ${LLM_EMBEDDER} ${LLM_CONNECTION} ${GITHUB_REPOSITORY} ${GITHUB_RUN_ID}' \
+          < "${TEMPLATE_PATH}" > evalrun.yaml
 
         echo "Rendered EvalRun manifest:"
         cat evalrun.yaml
@@ -207,6 +351,7 @@ runs:
         DEADLINE_SECONDS=1500
         INTERVAL_SECONDS=10
         ELAPSED=0
+        SUMMARY=""
 
         while [ "${ELAPSED}" -lt "${DEADLINE_SECONDS}" ]; do
           JSON="$(kubectl -n "${NAMESPACE}" get evalruns.ai.evaluation.io "${EVALRUN_NAME}" -o json 2>/dev/null || echo '{}')"
@@ -215,8 +360,13 @@ runs:
           PHASE="$(jq -r '.status.phase // empty' <<<"${JSON}")"
           VERDICT="$(jq -r '.status.verdict // empty' <<<"${JSON}")"
           STAGE="$(jq -r '.status.rootCause.stage // empty' <<<"${JSON}")"
+          SUMMARY="$(jq -r '.status.summary // empty' <<<"${JSON}")"
 
           echo "elapsed=${ELAPSED}s generation=${GEN:-?} observed=${OBSERVED} phase=${PHASE:-<empty>} verdict=${VERDICT:-<empty>} stage=${STAGE:-<empty>}"
+          # A PENDING run says why (invalid suite, invalid spec.llm, dataset not found, ...): show it while waiting.
+          if [ "${PHASE}" = "PENDING" ] && [ -n "${SUMMARY}" ]; then
+            echo "  pending: ${SUMMARY}"
+          fi
 
           # A newer push re-applied the same EvalRun: this commit's result will never be reported.
           if [ -n "${GEN}" ] && [ "${GEN}" -gt "${APPLIED_GENERATION}" ]; then
@@ -233,8 +383,7 @@ runs:
           ELAPSED=$((ELAPSED + INTERVAL_SECONDS))
         done
 
-        echo "Timed out waiting for EvalRun/${EVALRUN_NAME}"
-        echo "If status.observedGeneration never appears, the controller predates re-evaluation support: upgrade it."
+        echo "::error::Timed out waiting for EvalRun/${EVALRUN_NAME}. Last status: phase=${PHASE:-<empty>} ${SUMMARY:+summary: ${SUMMARY}}"
         exit 1
 
     - name: Read EvalRun result
@@ -269,21 +418,25 @@ runs:
               ($rc.artifactUri // empty | "evidence: \(.)") ]
           | join("\n")' <<<"${JSON}")"
 
-        REPORT_URL="$(field .status.artifacts.scoresUri)"
-        SUMMARY_URL="$(field .status.artifacts.gateSummaryUri)"
-        RAW_RESULTS_URL="$(field .status.artifacts.detailsUri)"
+        # Every artifact the runner reported; multi-turn runs add the manifest, violations and conversations.
+        ARTIFACTS="$(jq -r '
+          (.status.artifacts // {}) as $a
+          | [ ["Scores", $a.scoresUri], ["Gate summary", $a.gateSummaryUri], ["Raw results", $a.detailsUri],
+              ["Violations", $a.violationsUri], ["Conversations", $a.conversationsUri], ["Manifest", $a.manifestUri] ][]
+          | select(.[1] != null and .[1] != "")
+          | "- **\(.[0]):** \(.[1])"' <<<"${JSON}")"
 
         {
           echo "phase=${PHASE}"
           echo "verdict=${VERDICT}"
           echo "root_cause=${ROOT_CAUSE}"
-          echo "report_url=${REPORT_URL}"
-          echo "summary_url=${SUMMARY_URL}"
-          echo "raw_results_url=${RAW_RESULTS_URL}"
-          # Multi-line value: GitHub's heredoc output syntax.
+          # Multi-line values: GitHub's heredoc output syntax.
           echo "root_cause_details<<__RC_EOF__"
           echo "${ROOT_CAUSE_DETAILS}"
           echo "__RC_EOF__"
+          echo "artifacts<<__ART_EOF__"
+          echo "${ARTIFACTS}"
+          echo "__ART_EOF__"
         } >> "$GITHUB_OUTPUT"
 
         {
@@ -312,9 +465,7 @@ runs:
           echo ""
           echo "### Artifacts"
           echo ""
-          echo "- Scores: ${REPORT_URL:-not available}"
-          echo "- Gate summary: ${SUMMARY_URL:-not available}"
-          echo "- Raw results: ${RAW_RESULTS_URL:-not available}"
+          echo "${ARTIFACTS:-No artifacts reported.}"
         } >> "$GITHUB_STEP_SUMMARY"
 
     - name: Post or Update PR Comment
@@ -326,14 +477,12 @@ runs:
         REPO: ${{ github.repository }}
         EVALRUN_NAME: ${{ steps.ctx.outputs.evalrun_name }}
         EVALSUITE_NAME: ${{ steps.ctx.outputs.evalsuite_name }}
-        EVAL_TYPE: ${{ steps.evaltype.outputs.type }}
+        EVAL_KIND: ${{ steps.suite.outputs.kind }}
         PHASE: ${{ steps.result.outputs.phase }}
         VERDICT: ${{ steps.result.outputs.verdict }}
         ROOT_CAUSE: ${{ steps.result.outputs.root_cause }}
         ROOT_CAUSE_DETAILS: ${{ steps.result.outputs.root_cause_details }}
-        REPORT_URL: ${{ steps.result.outputs.report_url }}
-        SUMMARY_URL: ${{ steps.result.outputs.summary_url }}
-        RAW_RESULTS_URL: ${{ steps.result.outputs.raw_results_url }}
+        ARTIFACTS: ${{ steps.result.outputs.artifacts }}
         GIT_SHA: ${{ github.sha }}
       run: |
         set -euo pipefail
@@ -365,44 +514,44 @@ runs:
         | **Status / Phase** | \`${PHASE:-UNKNOWN}\` |
         | **Verdict** | ${BADGE} |
         | **EvalSuite** | \`${EVALSUITE_NAME}\` |
-        | **Type** | \`${EVAL_TYPE}\` |
+        | **Type** | \`${EVAL_KIND:-unknown}\` |
         | **EvalRun CR** | \`${EVALRUN_NAME}\` |
         | **Commit** | \`${GIT_SHA:0:7}\` |
 
         ${ROOT_CAUSE_SECTION}
 
         ### 📊 Evaluation Artifacts
-        - **Full Report:** ${REPORT_URL:-N/A}
-        - **Gate Summary:** ${SUMMARY_URL:-N/A}
-        - **Raw JSON Results:** ${RAW_RESULTS_URL:-N/A}
+        ${ARTIFACTS:-No artifacts reported.}
         EOF
         )
 
         PAYLOAD=$(jq -n --arg body "$COMMENT_BODY" '{body: $body}')
         API_RESPONSE="${RUNNER_TEMP:-/tmp}/ai-eval-gate-api-response.json"
+        API="https://api.github.com/repos/${REPO}"
+        AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github.v3+json")
 
+        # Walk every page: a PR with more than 100 comments would otherwise get a duplicate gate comment.
         echo "Checking for existing PR comment..."
-        RESPONSE=$(curl -s -S \
-          -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-          -H "Accept: application/vnd.github.v3+json" \
-          "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100")
-
-        EXISTING_COMMENT_ID=$(echo "$RESPONSE" | jq -r --arg marker "$MARKER" 'if type=="array" then (.[] | select(.body | contains($marker)) | .id) else empty end' | head -n 1)
+        EXISTING_COMMENT_ID=""
+        PAGE=1
+        while :; do
+          RESPONSE=$(curl -s -S "${AUTH[@]}" "${API}/issues/${PR_NUMBER}/comments?per_page=100&page=${PAGE}")
+          COUNT=$(jq -r 'if type=="array" then length else 0 end' <<<"${RESPONSE}")
+          EXISTING_COMMENT_ID=$(jq -r --arg marker "$MARKER" 'if type=="array" then (.[] | select(.body | contains($marker)) | .id) else empty end' <<<"${RESPONSE}" | head -n 1)
+          if [ -n "${EXISTING_COMMENT_ID}" ] || [ "${COUNT}" -lt 100 ]; then
+            break
+          fi
+          PAGE=$((PAGE + 1))
+        done
 
         if [ -n "${EXISTING_COMMENT_ID:-}" ] && [ "${EXISTING_COMMENT_ID}" != "null" ]; then
           echo "Updating existing PR comment (ID: ${EXISTING_COMMENT_ID})..."
-          HTTP_STATUS=$(curl -s -o "${API_RESPONSE}" -w "%{http_code}" -X PATCH \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            -d "${PAYLOAD}" \
-            "https://api.github.com/repos/${REPO}/issues/comments/${EXISTING_COMMENT_ID}")
+          HTTP_STATUS=$(curl -s -o "${API_RESPONSE}" -w "%{http_code}" -X PATCH "${AUTH[@]}" \
+            -d "${PAYLOAD}" "${API}/issues/comments/${EXISTING_COMMENT_ID}")
         else
           echo "Creating new PR comment..."
-          HTTP_STATUS=$(curl -s -o "${API_RESPONSE}" -w "%{http_code}" -X POST \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            -d "${PAYLOAD}" \
-            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments")
+          HTTP_STATUS=$(curl -s -o "${API_RESPONSE}" -w "%{http_code}" -X POST "${AUTH[@]}" \
+            -d "${PAYLOAD}" "${API}/issues/${PR_NUMBER}/comments")
         fi
 
         echo "GitHub API HTTP Status Code: ${HTTP_STATUS}"
